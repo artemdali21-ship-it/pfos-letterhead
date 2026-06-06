@@ -91,6 +91,43 @@ def detect_entity(entity_name: str) -> dict:
     return ENTITIES["ip"]
 
 
+def parse_card_data(card_text: str) -> dict:
+    """Parse extracted card text into structured fields.
+
+    Expected input format (from Claude extraction):
+        Компания: ООО «Ромашка»
+        ИНН: 1234567890
+        КПП: 123456789
+        ОГРН: 1234567890123
+        Адрес: 109028, г. Москва, ...
+        Контакт: Иванов Иван Иванович
+        Должность: Генеральный директор
+        Телефон: +7 ...
+        Email: ...
+    """
+    fields: dict = {}
+    for line in card_text.split("\n"):
+        if ":" in line:
+            key, _, val = line.partition(":")
+            fields[key.strip().lower()] = val.strip()
+
+    # Normalise keys (Russian variants)
+    def _get(*keys):
+        for k in keys:
+            v = fields.get(k)
+            if v:
+                return v
+        return ""
+
+    return {
+        "company":  _get("компания", "организация", "company"),
+        "inn":      _get("инн", "inn"),
+        "address":  _get("адрес", "address"),
+        "contact":  _get("контакт", "contact", "фио", "имя"),
+        "position": _get("должность", "position", "роль"),
+    }
+
+
 def draw_header(c, entity: dict) -> float:
     """Draw letterhead header. Returns y position below divider."""
     y_top = PAGE_H - M_TOP
@@ -154,21 +191,75 @@ def draw_footer(c, entity: dict = None):
     c.drawRightString(PAGE_W - M_RIGHT, y, datetime.now().strftime("%d.%m.%Y"))
 
 
-def draw_body(c, text: str, entity: dict, date: str, start_y: float) -> float:
-    """Render letter body. Returns final y position."""
+def draw_recipient_block(c, card_text: str, y_start: float) -> float:
+    """Draw right-aligned recipient block (like in reference template).
+
+    Layout (right-aligned):
+        Должность получателя         ← regular, INK
+        Компания получателя          ← bold, INK
+        Фамилия И. О.                ← bold, INK
+        Адрес, г. Москва, ...        ← small, MUTED
+
+    Returns y position below the block (with gap).
+    """
+    if not card_text or not card_text.strip():
+        return y_start
+
+    parsed = parse_card_data(card_text)
+    x_right = PAGE_W - M_RIGHT
+    y = y_start
+
+    # Position / role
+    if parsed.get("position"):
+        c.setFont(FONT_REGULAR, 10); c.setFillColor(INK)
+        c.drawRightString(x_right, y, parsed["position"])
+        y -= 5.5 * mm
+
+    # Company name (bold)
+    if parsed.get("company"):
+        c.setFont(FONT_BOLD, 10); c.setFillColor(INK)
+        c.drawRightString(x_right, y, parsed["company"])
+        y -= 5.5 * mm
+
+    # Contact name (bold)
+    if parsed.get("contact"):
+        c.setFont(FONT_BOLD, 10); c.setFillColor(INK)
+        c.drawRightString(x_right, y, parsed["contact"])
+        y -= 5.5 * mm
+
+    # Address (small, muted) — truncate if too long
+    if parsed.get("address"):
+        addr = parsed["address"]
+        c.setFont(FONT_REGULAR, 8.5); c.setFillColor(MUTED)
+        max_w = PAGE_W / 2  # right half only
+        while addr and c.stringWidth(addr, FONT_REGULAR, 8.5) > max_w:
+            addr = addr[:addr.rfind(",") if "," in addr else -3]
+        c.drawRightString(x_right, y, addr)
+        y -= 5 * mm
+
+    return y - 8 * mm   # gap before date / body
+
+
+def draw_body(c, text: str, entity: dict, date: str, start_y: float,
+              recipient: str = "") -> float:
+    """Render letter body (with optional recipient block). Returns final y."""
     text_w = PAGE_W - M_LEFT - M_RIGHT
     line_h = 5.5 * mm
     bottom_limit = M_BOTTOM + 55 * mm  # leave room for signature + seal
 
     y = start_y - 8 * mm
 
-    # Date (top right)
+    # ── Recipient block (right-aligned, à la reference template) ──
+    if recipient and recipient.strip():
+        y = draw_recipient_block(c, recipient, y)
+
+    # ── Date (right-aligned) ──
     if date:
         c.setFillColor(MUTED); c.setFont(FONT_REGULAR, 10)
         c.drawRightString(PAGE_W - M_RIGHT, y, date)
         y -= 10 * mm
 
-    # Letter text
+    # ── Letter text ──
     c.setFillColor(INK); c.setFont(FONT_REGULAR, 10)
 
     for raw_line in text.split("\n"):
@@ -247,13 +338,13 @@ def draw_signature(c, entity: dict, sig_y: float):
                     width=seal_w, height=seal_h, mask="auto", preserveAspectRatio=True)
 
 
-def draw_letter(buffer: io.BytesIO, text: str, entity_name: str, date: str) -> None:
+def draw_letter(buffer: io.BytesIO, text: str, entity_name: str,
+                date: str, recipient: str = "") -> None:
     entity = detect_entity(entity_name)
     c = canvas.Canvas(buffer, pagesize=A4)
     divider_y = draw_header(c, entity)
     draw_footer(c, entity)
-    final_y = draw_body(c, text, entity, date, divider_y)
-    # Signature sits ~55mm from bottom
+    final_y = draw_body(c, text, entity, date, divider_y, recipient=recipient)
     sig_y = M_BOTTOM + 48 * mm
     draw_signature(c, entity, sig_y)
     c.showPage()
@@ -266,6 +357,7 @@ class LetterRequest(BaseModel):
     entity_name: str = "ИП Лапшенков"
     date: str = ""
     seal: bool = True
+    recipient: str = ""   # raw card_data text from Claude extraction
 
 
 class SendLetterRequest(BaseModel):
@@ -276,13 +368,14 @@ class SendLetterRequest(BaseModel):
     chat_id: str
     bot_token: str
     caption: str = ""
+    recipient: str = ""   # raw card_data text from Claude extraction
 
 
 # ── Endpoints ──
 @app.post("/generate")
 async def generate_pdf(req: LetterRequest):
     buf = io.BytesIO()
-    draw_letter(buf, req.text, req.entity_name, req.date)
+    draw_letter(buf, req.text, req.entity_name, req.date, req.recipient)
     return JSONResponse({"pdf_base64": base64.b64encode(buf.getvalue()).decode()})
 
 
@@ -290,7 +383,7 @@ async def generate_pdf(req: LetterRequest):
 async def send_letter(req: SendLetterRequest):
     """Generate PDF with real letterhead and send directly to Telegram."""
     buf = io.BytesIO()
-    draw_letter(buf, req.text, req.entity_name, req.date)
+    draw_letter(buf, req.text, req.entity_name, req.date, req.recipient)
     pdf_bytes = buf.getvalue()
 
     fname   = f"Письмо_{datetime.now().strftime('%Y-%m-%d')}.pdf"
