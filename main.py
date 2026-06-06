@@ -1,30 +1,242 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import base64, io, httpx
+import base64, io, httpx, os
 from datetime import datetime
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import cm
-from reportlab.lib.colors import HexColor, black, white
+from reportlab.lib.units import mm
+from reportlab.lib.colors import HexColor
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-import os, math
 
 app = FastAPI()
 
-# Register DejaVu fonts for Cyrillic support
-FONT_DIR = "/usr/share/fonts/truetype/dejavu"
-try:
-    pdfmetrics.registerFont(TTFont("DejaVu", f"{FONT_DIR}/DejaVuSans.ttf"))
-    pdfmetrics.registerFont(TTFont("DejaVuBold", f"{FONT_DIR}/DejaVuSans-Bold.ttf"))
-    FONT_NAME = "DejaVu"
-    FONT_BOLD = "DejaVuBold"
-except Exception:
-    FONT_NAME = "Helvetica"
-    FONT_BOLD = "Helvetica-Bold"
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# ── Fonts ──
+FONT_REGULAR = "Helvetica"
+FONT_BOLD    = "Helvetica-Bold"
+FONT_ITALIC  = "Helvetica-Oblique"
+
+for candidate_dir in ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/dejavu", "/Library/Fonts"]:
+    reg    = os.path.join(candidate_dir, "DejaVuSans.ttf")
+    bold   = os.path.join(candidate_dir, "DejaVuSans-Bold.ttf")
+    italic = os.path.join(candidate_dir, "DejaVuSans-Oblique.ttf")
+    if os.path.exists(reg) and os.path.exists(bold):
+        pdfmetrics.registerFont(TTFont("BrandSans",       reg))
+        pdfmetrics.registerFont(TTFont("BrandSans-Bold",  bold))
+        if os.path.exists(italic):
+            pdfmetrics.registerFont(TTFont("BrandSans-Italic", italic))
+        FONT_REGULAR = "BrandSans"
+        FONT_BOLD    = "BrandSans-Bold"
+        FONT_ITALIC  = "BrandSans-Italic" if os.path.exists(italic) else "BrandSans"
+        break
+
+# ── Colors ──
+ORANGE = HexColor("#E97C3F")
+INK    = HexColor("#1A1A1A")
+MUTED  = HexColor("#666666")
+GREY   = HexColor("#DDDDDD")
+
+# ── Page margins ──
+PAGE_W, PAGE_H = A4
+M_LEFT   = 20 * mm
+M_RIGHT  = 20 * mm
+M_TOP    = 18 * mm
+M_BOTTOM = 18 * mm
+
+# ── Entity configs ──
+ENTITIES = {
+    "ip": {
+        "name":    "ИП Лапшенков Сергей Владимирович",
+        "inn":     "772781135013",
+        "ogrnip":  "321774600475424",
+        "addr":    "117628, г. Москва, ул. Знаменские Садки, д. 3, корп. 5, кв. 238",
+        "contact": "+7 905 709-02-88 · 5604975@mail.ru",
+        "signer":  "Индивидуальный предприниматель\nЛапшенков Сергей Владимирович",
+        "brand":   "бренд Good Support",
+        "seal":    os.path.join(HERE, "seal_lapshenkov.png"),
+        "seal_w":  70 * mm,
+        "seal_ar": 826 / 1140,
+    },
+    "smart4yu": {
+        "name":    "ООО «Смарт4Ю»",
+        "inn":     "9718238330",
+        "ogrnip":  "1237700756064",
+        "addr":    "г. Москва",
+        "contact": "goodsupport.ru",
+        "signer":  "Директор\nБерлизева Алина Евгеньевна",
+        "brand":   "Good Support",
+        "seal":    os.path.join(HERE, "seal_smartforyou.png"),
+        "seal_w":  60 * mm,
+        "seal_ar": 1.0,
+    },
+}
 
 
+def detect_entity(entity_name: str) -> dict:
+    name_lower = entity_name.lower()
+    if "смарт" in name_lower or "smart" in name_lower:
+        return ENTITIES["smart4yu"]
+    return ENTITIES["ip"]
+
+
+def draw_header(c, entity: dict) -> float:
+    """Draw letterhead header. Returns y position below divider."""
+    y_top = PAGE_H - M_TOP
+
+    # Logo
+    logo_path = os.path.join(HERE, "logo_goodsupport.png")
+    if os.path.exists(logo_path):
+        logo_w = 55 * mm
+        logo_h = logo_w * (188 / 674)
+        c.drawImage(logo_path, M_LEFT, y_top - logo_h - 2 * mm,
+                    width=logo_w, height=logo_h, mask="auto", preserveAspectRatio=True)
+
+    # Company name + details (right side)
+    x_right = PAGE_W - M_RIGHT
+    line_y  = y_top - 4 * mm
+    c.setFillColor(INK); c.setFont(FONT_BOLD, 11)
+    c.drawRightString(x_right, line_y, entity["name"])
+
+    line_y -= 5.5 * mm
+    c.setFont(FONT_REGULAR, 9)
+    label_inn = "ИНН " if entity.get("ogrnip") else "ИНН "
+    label_ogrn = " · ОГРНИП " if "ip" in entity["name"].lower() or "лапш" in entity["name"].lower() else " · ОГРН "
+    parts = [
+        ("ИНН ", INK), (entity["inn"], ORANGE),
+        (label_ogrn, INK), (entity["ogrnip"], ORANGE),
+    ]
+    full_w = sum(c.stringWidth(s, FONT_REGULAR, 9) for s, _ in parts)
+    x_cur = x_right - full_w
+    for s, color in parts:
+        c.setFillColor(color); c.drawString(x_cur, line_y, s)
+        x_cur += c.stringWidth(s, FONT_REGULAR, 9)
+
+    line_y -= 5 * mm
+    c.setFillColor(INK)
+    c.drawRightString(x_right, line_y, entity["addr"])
+    line_y -= 4.5 * mm
+    c.drawRightString(x_right, line_y, entity["contact"])
+
+    # Orange divider
+    divider_y = y_top - 30 * mm
+    c.setStrokeColor(ORANGE); c.setLineWidth(1.2)
+    c.line(M_LEFT, divider_y, PAGE_W - M_RIGHT, divider_y)
+
+    return divider_y
+
+
+def draw_footer(c):
+    """Draw page footer."""
+    y = M_BOTTOM
+    c.setStrokeColor(GREY); c.setLineWidth(0.5)
+    c.line(M_LEFT, y + 5 * mm, PAGE_W - M_RIGHT, y + 5 * mm)
+    c.setFillColor(MUTED); c.setFont(FONT_REGULAR, 8)
+    c.drawString(M_LEFT, y, "Good Support · Официальное письмо")
+    c.drawRightString(PAGE_W - M_RIGHT, y, datetime.now().strftime("%d.%m.%Y"))
+
+
+def draw_body(c, text: str, entity: dict, date: str, start_y: float) -> float:
+    """Render letter body. Returns final y position."""
+    text_w = PAGE_W - M_LEFT - M_RIGHT
+    line_h = 5.5 * mm
+    bottom_limit = M_BOTTOM + 55 * mm  # leave room for signature + seal
+
+    y = start_y - 8 * mm
+
+    # Date (top right)
+    if date:
+        c.setFillColor(MUTED); c.setFont(FONT_REGULAR, 10)
+        c.drawRightString(PAGE_W - M_RIGHT, y, date)
+        y -= 10 * mm
+
+    # Letter text
+    c.setFillColor(INK); c.setFont(FONT_REGULAR, 10)
+
+    for raw_line in text.split("\n"):
+        # Empty line → paragraph gap
+        if not raw_line.strip():
+            y -= line_h * 0.6
+            continue
+
+        words = raw_line.split(" ")
+        current = ""
+        for word in words:
+            test = (current + " " + word).strip()
+            if c.stringWidth(test, FONT_REGULAR, 10) <= text_w:
+                current = test
+            else:
+                if y < bottom_limit:
+                    c.showPage()
+                    draw_header(c, entity)
+                    draw_footer(c)
+                    y = PAGE_H - M_TOP - 38 * mm
+                    c.setFillColor(INK); c.setFont(FONT_REGULAR, 10)
+                c.drawString(M_LEFT, y, current)
+                y -= line_h
+                current = word
+        # Last chunk of line
+        if y < bottom_limit:
+            c.showPage()
+            draw_header(c, entity)
+            draw_footer(c)
+            y = PAGE_H - M_TOP - 38 * mm
+            c.setFillColor(INK); c.setFont(FONT_REGULAR, 10)
+        if current:
+            c.drawString(M_LEFT, y, current)
+            y -= line_h
+
+    return y
+
+
+def draw_signature(c, entity: dict, sig_y: float):
+    """Draw signature block with real seal."""
+    c.setFillColor(INK); c.setFont(FONT_REGULAR, 10)
+
+    # Signer lines
+    for i, line in enumerate(entity["signer"].split("\n")):
+        c.drawString(M_LEFT, sig_y - i * 5.5 * mm, line)
+
+    # Brand subtitle
+    if entity.get("brand"):
+        c.setFont(FONT_ITALIC, 9); c.setFillColor(MUTED)
+        c.drawString(M_LEFT, sig_y - 11 * mm, entity["brand"])
+
+    # Signature line
+    c.setStrokeColor(INK); c.setLineWidth(0.6); c.setDash()
+    line_y = sig_y - 23 * mm
+    c.line(M_LEFT, line_y, M_LEFT + 80 * mm, line_y)
+    c.setFillColor(MUTED); c.setFont(FONT_ITALIC, 8)
+    name_short = entity["signer"].split("\n")[-1].split()
+    initials = name_short[0] + " " + " ".join(p[0] + "." for p in name_short[1:]) if len(name_short) > 1 else name_short[0]
+    c.drawString(M_LEFT, line_y - 4 * mm, f"подпись / {initials} /")
+
+    # Seal PNG
+    seal_path = entity.get("seal", "")
+    if seal_path and os.path.exists(seal_path):
+        seal_w = entity.get("seal_w", 65 * mm)
+        seal_h = seal_w * entity.get("seal_ar", 1.0)
+        seal_x = PAGE_W - M_RIGHT - seal_w
+        c.drawImage(seal_path, seal_x, line_y - 2 * mm,
+                    width=seal_w, height=seal_h, mask="auto", preserveAspectRatio=True)
+
+
+def draw_letter(buffer: io.BytesIO, text: str, entity_name: str, date: str) -> None:
+    entity = detect_entity(entity_name)
+    c = canvas.Canvas(buffer, pagesize=A4)
+    divider_y = draw_header(c, entity)
+    draw_footer(c)
+    final_y = draw_body(c, text, entity, date, divider_y)
+    # Signature sits ~55mm from bottom
+    sig_y = M_BOTTOM + 48 * mm
+    draw_signature(c, entity, sig_y)
+    c.showPage()
+    c.save()
+
+
+# ── Models ──
 class LetterRequest(BaseModel):
     text: str
     entity_name: str = "ИП Лапшенков"
@@ -42,127 +254,22 @@ class SendLetterRequest(BaseModel):
     caption: str = ""
 
 
-def draw_letter(buffer: io.BytesIO, req: LetterRequest) -> None:
-    W, H = A4
-    c = canvas.Canvas(buffer, pagesize=A4)
-
-    DARK = HexColor("#2c3e50")
-    GREY = HexColor("#7f8c8d")
-    LIGHT = HexColor("#bdc3c7")
-    margin_l = 3 * cm
-    margin_r = 2 * cm
-    text_width = W - margin_l - margin_r
-
-    y = H - 2 * cm
-
-    # ── Header: company name ──
-    c.setFillColor(DARK)
-    c.setFont(FONT_BOLD, 16)
-    name = req.entity_name.upper()
-    name_w = c.stringWidth(name, FONT_BOLD, 16)
-    c.drawString((W - name_w) / 2, y, name)
-    y -= 0.5 * cm
-
-    c.setFont(FONT_NAME, 8)
-    c.setFillColor(GREY)
-    tagline = "GoodSupport  ·  Официальное письмо"
-    tg_w = c.stringWidth(tagline, FONT_NAME, 8)
-    c.drawString((W - tg_w) / 2, y, tagline)
-    y -= 0.35 * cm
-
-    # Divider line
-    c.setStrokeColor(DARK)
-    c.setLineWidth(1.5)
-    c.line(margin_l, y, W - margin_r, y)
-    y -= 0.8 * cm
-
-    # ── Date ──
-    if req.date:
-        c.setFont(FONT_NAME, 10)
-        c.setFillColor(GREY)
-        date_w = c.stringWidth(req.date, FONT_NAME, 10)
-        c.drawString(W - margin_r - date_w, y, req.date)
-        y -= 0.8 * cm
-
-    # ── Letter body ──
-    c.setFont(FONT_NAME, 11.5)
-    c.setFillColor(black)
-    line_h = 0.62 * cm
-    bottom_margin = 5 * cm
-
-    for raw_line in req.text.split("\n"):
-        words = raw_line.split(" ") if raw_line.strip() else [""]
-        current = ""
-        for word in words:
-            test = (current + " " + word).strip()
-            if c.stringWidth(test, FONT_NAME, 11.5) <= text_width:
-                current = test
-            else:
-                if y < bottom_margin:
-                    c.showPage()
-                    y = H - 2 * cm
-                    c.setFont(FONT_NAME, 11.5)
-                    c.setFillColor(black)
-                c.drawString(margin_l, y, current)
-                y -= line_h
-                current = word
-        if y < bottom_margin:
-            c.showPage()
-            y = H - 2 * cm
-            c.setFont(FONT_NAME, 11.5)
-            c.setFillColor(black)
-        c.drawString(margin_l, y, current)
-        y -= line_h
-
-    # ── Footer divider ──
-    footer_y = 3.5 * cm
-    c.setStrokeColor(LIGHT)
-    c.setLineWidth(0.8)
-    c.line(margin_l, footer_y, W - margin_r, footer_y)
-
-    # ── Seal circle ──
-    if req.seal:
-        seal_cx = W - margin_r - 2 * cm
-        seal_cy = footer_y - 1.5 * cm
-        seal_r = 1.5 * cm
-
-        c.setStrokeColor(DARK)
-        c.setFillColor(white)
-        c.setLineWidth(2)
-        c.circle(seal_cx, seal_cy, seal_r, stroke=1, fill=1)
-
-        c.setFillColor(DARK)
-        c.setFont(FONT_BOLD, 7)
-        short = req.entity_name.replace("ООО ", "").replace("ИП ", "")[:12]
-        lines_seal = ["М.П.", "ПЕЧАТЬ", short]
-        for i, sl in enumerate(lines_seal):
-            sw = c.stringWidth(sl, FONT_BOLD, 7)
-            c.drawString(seal_cx - sw / 2, seal_cy + 0.3 * cm - i * 0.45 * cm, sl)
-
-    c.save()
-
-
+# ── Endpoints ──
 @app.post("/generate")
 async def generate_pdf(req: LetterRequest):
     buf = io.BytesIO()
-    draw_letter(buf, req)
-    pdf_bytes = buf.getvalue()
-    return JSONResponse({"pdf_base64": base64.b64encode(pdf_bytes).decode()})
+    draw_letter(buf, req.text, req.entity_name, req.date)
+    return JSONResponse({"pdf_base64": base64.b64encode(buf.getvalue()).decode()})
 
 
 @app.post("/send")
 async def send_letter(req: SendLetterRequest):
-    """Generate PDF and send directly to Telegram — bypasses n8n binary upload issues."""
+    """Generate PDF with real letterhead and send directly to Telegram."""
     buf = io.BytesIO()
-    draw_letter(buf, LetterRequest(
-        text=req.text,
-        entity_name=req.entity_name,
-        date=req.date,
-        seal=req.seal
-    ))
+    draw_letter(buf, req.text, req.entity_name, req.date)
     pdf_bytes = buf.getvalue()
 
-    fname = f"Письмо_{datetime.now().strftime('%Y-%m-%d')}.pdf"
+    fname   = f"Письмо_{datetime.now().strftime('%Y-%m-%d')}.pdf"
     caption = req.caption or f"📄 Письмо — {req.entity_name}"
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -175,13 +282,17 @@ async def send_letter(req: SendLetterRequest):
     result = resp.json()
     if result.get("ok"):
         return {"success": True}
-    else:
-        return JSONResponse(
-            {"success": False, "error": result.get("description", "Telegram error")},
-            status_code=500
-        )
+    return JSONResponse(
+        {"success": False, "error": result.get("description", "Telegram error")},
+        status_code=500
+    )
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "font": FONT_NAME}
+    assets = {
+        "logo":          os.path.exists(os.path.join(HERE, "logo_goodsupport.png")),
+        "seal_ip":       os.path.exists(os.path.join(HERE, "seal_lapshenkov.png")),
+        "seal_smart4yu": os.path.exists(os.path.join(HERE, "seal_smartforyou.png")),
+    }
+    return {"status": "ok", "font": FONT_REGULAR, "assets": assets}
