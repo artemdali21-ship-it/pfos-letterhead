@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import base64, io, httpx, os
+import base64, io, httpx, os, re
 from datetime import datetime
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -91,19 +91,37 @@ def detect_entity(entity_name: str) -> dict:
     return ENTITIES["ip"]
 
 
+def normalize_company_name(name: str) -> str:
+    """Convert full legal form to abbreviated (ООО, АО, ПАО etc.).
+
+    «Общество с ограниченной ответственностью «РСК-1»» → «ООО «РСК-1»»
+    """
+    patterns = [
+        (r'(?i)общество с ограниченной ответственностью\s*[«"]?([^»"\n]+)[»"]?', r'ООО «\1»'),
+        (r'(?i)публичное акционерное общество\s*[«"]?([^»"\n]+)[»"]?',           r'ПАО «\1»'),
+        (r'(?i)непубличное акционерное общество\s*[«"]?([^»"\n]+)[»"]?',         r'АО «\1»'),
+        (r'(?i)закрытое акционерное общество\s*[«"]?([^»"\n]+)[»"]?',            r'ЗАО «\1»'),
+        (r'(?i)акционерное общество\s*[«"]?([^»"\n]+)[»"]?',                     r'АО «\1»'),
+        (r'(?i)индивидуальный предприниматель\s+',                               r'ИП '),
+    ]
+    for pattern, replacement in patterns:
+        if re.search(pattern, name, re.IGNORECASE):
+            result = re.sub(pattern, replacement, name, flags=re.IGNORECASE).strip()
+            result = re.sub(r'«\s*«', '«', result)   # deduplicate guillemets
+            result = re.sub(r'»\s*»', '»', result)
+            return result
+    return name
+
+
 def parse_card_data(card_text: str) -> dict:
     """Parse extracted card text into structured fields.
 
     Expected input format (from Claude extraction):
         Компания: ООО «Ромашка»
         ИНН: 1234567890
-        КПП: 123456789
-        ОГРН: 1234567890123
         Адрес: 109028, г. Москва, ...
         Контакт: Иванов Иван Иванович
         Должность: Генеральный директор
-        Телефон: +7 ...
-        Email: ...
     """
     fields: dict = {}
     for line in card_text.split("\n"):
@@ -111,7 +129,6 @@ def parse_card_data(card_text: str) -> dict:
             key, _, val = line.partition(":")
             fields[key.strip().lower()] = val.strip()
 
-    # Normalise keys (Russian variants)
     def _get(*keys):
         for k in keys:
             v = fields.get(k)
@@ -119,8 +136,10 @@ def parse_card_data(card_text: str) -> dict:
                 return v
         return ""
 
+    company = normalize_company_name(_get("компания", "организация", "company"))
+
     return {
-        "company":  _get("компания", "организация", "company"),
+        "company":  company,
         "inn":      _get("инн", "inn"),
         "address":  _get("адрес", "address"),
         "contact":  _get("контакт", "contact", "фио", "имя"),
@@ -192,52 +211,74 @@ def draw_footer(c, entity: dict = None):
 
 
 def draw_recipient_block(c, card_text: str, y_start: float) -> float:
-    """Draw right-aligned recipient block (like in reference template).
+    """Draw right-aligned recipient block (matches reference template layout).
 
-    Layout (right-aligned):
-        Должность получателя         ← regular, INK
-        Компания получателя          ← bold, INK
-        Фамилия И. О.                ← bold, INK
-        Адрес, г. Москва, ...        ← small, MUTED
+    Layout (right-aligned, max half-page width):
+        Должность получателя         ← regular 10pt, INK
+        Компания получателя          ← bold 10pt,    INK
+        Иванов И. И.                 ← bold 10pt,    INK
+        109028, г. Москва, ул. ...   ← regular 8.5pt, MUTED
 
-    Returns y position below the block (with gap).
+    Returns y position below the block (with gap before date/body).
     """
     if not card_text or not card_text.strip():
         return y_start
 
     parsed = parse_card_data(card_text)
+    if not any(parsed.values()):
+        return y_start
+
     x_right = PAGE_W - M_RIGHT
+    # Max width for recipient block = right half of text area
+    MAX_W = (PAGE_W - M_LEFT - M_RIGHT) / 2 + 10 * mm  # ~85mm
     y = y_start
 
-    # Position / role
+    def _draw_right(text, font, size, color, lh=5.5 * mm):
+        """Draw right-aligned text, wrapping at MAX_W if needed. Returns new y."""
+        nonlocal y
+        c.setFont(font, size); c.setFillColor(color)
+        if c.stringWidth(text, font, size) <= MAX_W:
+            c.drawRightString(x_right, y, text)
+            y -= lh
+        else:
+            # Word-wrap into MAX_W lines
+            words = text.split()
+            line = ""
+            for word in words:
+                test = (line + " " + word).strip()
+                if c.stringWidth(test, font, size) <= MAX_W:
+                    line = test
+                else:
+                    if line:
+                        c.drawRightString(x_right, y, line)
+                        y -= lh
+                    line = word
+            if line:
+                c.drawRightString(x_right, y, line)
+                y -= lh
+
+    # Position / role  (regular)
     if parsed.get("position"):
-        c.setFont(FONT_REGULAR, 10); c.setFillColor(INK)
-        c.drawRightString(x_right, y, parsed["position"])
-        y -= 5.5 * mm
+        _draw_right(parsed["position"], FONT_REGULAR, 10, INK)
 
-    # Company name (bold)
+    # Company name  (bold)
     if parsed.get("company"):
-        c.setFont(FONT_BOLD, 10); c.setFillColor(INK)
-        c.drawRightString(x_right, y, parsed["company"])
-        y -= 5.5 * mm
+        _draw_right(parsed["company"], FONT_BOLD, 10, INK)
 
-    # Contact name (bold)
+    # Contact person  (bold)
     if parsed.get("contact"):
-        c.setFont(FONT_BOLD, 10); c.setFillColor(INK)
-        c.drawRightString(x_right, y, parsed["contact"])
-        y -= 5.5 * mm
+        _draw_right(parsed["contact"], FONT_BOLD, 10, INK)
 
-    # Address (small, muted) — truncate if too long
+    # Address  (small, muted) — trim at last comma if too wide
     if parsed.get("address"):
         addr = parsed["address"]
-        c.setFont(FONT_REGULAR, 8.5); c.setFillColor(MUTED)
-        max_w = PAGE_W / 2  # right half only
-        while addr and c.stringWidth(addr, FONT_REGULAR, 8.5) > max_w:
-            addr = addr[:addr.rfind(",") if "," in addr else -3]
-        c.drawRightString(x_right, y, addr)
-        y -= 5 * mm
+        c.setFont(FONT_REGULAR, 8.5)
+        while addr and c.stringWidth(addr, FONT_REGULAR, 8.5) > MAX_W:
+            comma = addr.rfind(",")
+            addr = addr[:comma].rstrip() if comma > 0 else addr[:-3] + "…"
+        _draw_right(addr, FONT_REGULAR, 8.5, MUTED, lh=5 * mm)
 
-    return y - 8 * mm   # gap before date / body
+    return y - 6 * mm   # gap before date / body
 
 
 def draw_body(c, text: str, entity: dict, date: str, start_y: float,
