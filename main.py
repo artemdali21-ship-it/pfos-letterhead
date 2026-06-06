@@ -77,6 +77,9 @@ ENTITIES = {
         "seal":         os.path.join(HERE, "seal_smartforyou.png"),
         "seal_w":       38 * mm,
         "seal_ar":      379 / 391,
+        "sig_img":      os.path.join(HERE, "signature_berlizeva.png"),
+        "sig_img_w":    30 * mm,
+        "sig_img_ar":   78 / 220,
     },
 }
 
@@ -216,6 +219,14 @@ def draw_signature(c, entity: dict, sig_y: float):
     if entity.get("brand"):
         c.setFont(FONT_ITALIC, 9); c.setFillColor(MUTED)
         c.drawString(M_LEFT, sig_y - 11 * mm, entity["brand"])
+
+    # Handwritten signature image (separate file, e.g. Smart4Yu)
+    sig_img_path = entity.get("sig_img", "")
+    if sig_img_path and os.path.exists(sig_img_path):
+        sig_img_w = entity.get("sig_img_w", 30 * mm)
+        sig_img_h = sig_img_w * entity.get("sig_img_ar", 78 / 220)
+        c.drawImage(sig_img_path, M_LEFT + 50 * mm, sig_y - 14 * mm,
+                    width=sig_img_w, height=sig_img_h, mask="auto", preserveAspectRatio=True)
 
     # Signature line
     c.setStrokeColor(INK); c.setLineWidth(0.6); c.setDash()
