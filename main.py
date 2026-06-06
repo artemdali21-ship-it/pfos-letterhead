@@ -49,28 +49,34 @@ M_BOTTOM = 18 * mm
 # ── Entity configs ──
 ENTITIES = {
     "ip": {
-        "name":    "ИП Лапшенков Сергей Владимирович",
-        "inn":     "772781135013",
-        "ogrnip":  "321774600475424",
-        "addr":    "117628, г. Москва, ул. Знаменские Садки, д. 3, корп. 5, кв. 238",
-        "contact": "+7 905 709-02-88 · 5604975@mail.ru",
-        "signer":  "Индивидуальный предприниматель\nЛапшенков Сергей Владимирович",
-        "brand":   "бренд Good Support",
-        "seal":    os.path.join(HERE, "seal_lapshenkov.png"),
-        "seal_w":  70 * mm,
-        "seal_ar": 826 / 1140,
+        "name":         "ИП Лапшенков Сергей Владимирович",
+        "inn":          "772781135013",
+        "kpp":          None,
+        "ogrnip":       "321774600475424",
+        "ogrn_label":   "ОГРНИП",
+        "addr":         "117628, г. Москва, ул. Знаменские Садки, д. 3, корп. 5, кв. 238",
+        "contact":      "+7 905 709-02-88 · 5604975@mail.ru",
+        "footer_left":  "Good Support · ИП Лапшенков С. В. · Москва",
+        "signer":       "Индивидуальный предприниматель\nЛапшенков Сергей Владимирович",
+        "brand":        "бренд Good Support",
+        "seal":         os.path.join(HERE, "seal_lapshenkov.png"),
+        "seal_w":       70 * mm,
+        "seal_ar":      826 / 1140,
     },
     "smart4yu": {
-        "name":    "ООО «Смарт4Ю»",
-        "inn":     "9718238330",
-        "ogrnip":  "1237700756064",
-        "addr":    "г. Москва",
-        "contact": "goodsupport.ru",
-        "signer":  "Директор\nБерлизева Алина Евгеньевна",
-        "brand":   "Good Support",
-        "seal":    os.path.join(HERE, "seal_smartforyou.png"),
-        "seal_w":  60 * mm,
-        "seal_ar": 1.0,
+        "name":         "ООО «СМАРТ4Ю»",
+        "inn":          "7709448483",
+        "kpp":          "770901001",
+        "ogrnip":       "1157746089929",
+        "ogrn_label":   "ОГРН",
+        "addr":         "109028, г. Москва, Хохловский пер., д. 15, помещ. 1В/П",
+        "contact":      "Сбербанк · р/с 40702810238000248725 · БИК 044525225",
+        "footer_left":  "Good Support · ООО «СМАРТ4Ю» · Москва",
+        "signer":       "Директор\nБерлизева Алина Евгеньевна",
+        "brand":        "Good Support",
+        "seal":         os.path.join(HERE, "seal_smartforyou.png"),
+        "seal_w":       38 * mm,
+        "seal_ar":      379 / 391,
     },
 }
 
@@ -102,12 +108,18 @@ def draw_header(c, entity: dict) -> float:
 
     line_y -= 5.5 * mm
     c.setFont(FONT_REGULAR, 9)
-    label_inn = "ИНН " if entity.get("ogrnip") else "ИНН "
-    label_ogrn = " · ОГРНИП " if "ip" in entity["name"].lower() or "лапш" in entity["name"].lower() else " · ОГРН "
-    parts = [
-        ("ИНН ", INK), (entity["inn"], ORANGE),
-        (label_ogrn, INK), (entity["ogrnip"], ORANGE),
-    ]
+    ogrn_label = " · " + entity.get("ogrn_label", "ОГРН") + " "
+    if entity.get("kpp"):
+        parts = [
+            ("ИНН ", INK), (entity["inn"], ORANGE),
+            (" · КПП ", INK), (entity["kpp"], ORANGE),
+            (ogrn_label, INK), (entity["ogrnip"], ORANGE),
+        ]
+    else:
+        parts = [
+            ("ИНН ", INK), (entity["inn"], ORANGE),
+            (ogrn_label, INK), (entity["ogrnip"], ORANGE),
+        ]
     full_w = sum(c.stringWidth(s, FONT_REGULAR, 9) for s, _ in parts)
     x_cur = x_right - full_w
     for s, color in parts:
@@ -128,13 +140,14 @@ def draw_header(c, entity: dict) -> float:
     return divider_y
 
 
-def draw_footer(c):
+def draw_footer(c, entity: dict = None):
     """Draw page footer."""
     y = M_BOTTOM
     c.setStrokeColor(GREY); c.setLineWidth(0.5)
     c.line(M_LEFT, y + 5 * mm, PAGE_W - M_RIGHT, y + 5 * mm)
     c.setFillColor(MUTED); c.setFont(FONT_REGULAR, 8)
-    c.drawString(M_LEFT, y, "Good Support · Официальное письмо")
+    footer_left = (entity or {}).get("footer_left", "Good Support · Официальное письмо")
+    c.drawString(M_LEFT, y, footer_left)
     c.drawRightString(PAGE_W - M_RIGHT, y, datetime.now().strftime("%d.%m.%Y"))
 
 
@@ -171,7 +184,7 @@ def draw_body(c, text: str, entity: dict, date: str, start_y: float) -> float:
                 if y < bottom_limit:
                     c.showPage()
                     draw_header(c, entity)
-                    draw_footer(c)
+                    draw_footer(c, entity)
                     y = PAGE_H - M_TOP - 38 * mm
                     c.setFillColor(INK); c.setFont(FONT_REGULAR, 10)
                 c.drawString(M_LEFT, y, current)
@@ -181,7 +194,7 @@ def draw_body(c, text: str, entity: dict, date: str, start_y: float) -> float:
         if y < bottom_limit:
             c.showPage()
             draw_header(c, entity)
-            draw_footer(c)
+            draw_footer(c, entity)
             y = PAGE_H - M_TOP - 38 * mm
             c.setFillColor(INK); c.setFont(FONT_REGULAR, 10)
         if current:
@@ -227,7 +240,7 @@ def draw_letter(buffer: io.BytesIO, text: str, entity_name: str, date: str) -> N
     entity = detect_entity(entity_name)
     c = canvas.Canvas(buffer, pagesize=A4)
     divider_y = draw_header(c, entity)
-    draw_footer(c)
+    draw_footer(c, entity)
     final_y = draw_body(c, text, entity, date, divider_y)
     # Signature sits ~55mm from bottom
     sig_y = M_BOTTOM + 48 * mm
