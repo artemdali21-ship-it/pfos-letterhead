@@ -1,10 +1,29 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import base64, html as html_lib
-from weasyprint import HTML
+import base64, io
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib.colors import HexColor, black, white
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+import os, math
 
 app = FastAPI()
+
+# Register DejaVu fonts for Cyrillic support
+FONT_DIR = "/usr/share/fonts/truetype/dejavu"
+try:
+    pdfmetrics.registerFont(TTFont("DejaVu", f"{FONT_DIR}/DejaVuSans.ttf"))
+    pdfmetrics.registerFont(TTFont("DejaVuBold", f"{FONT_DIR}/DejaVuSans-Bold.ttf"))
+    FONT_NAME = "DejaVu"
+    FONT_BOLD = "DejaVuBold"
+except Exception:
+    # Fallback to Helvetica (no Cyrillic, but won't crash)
+    FONT_NAME = "Helvetica"
+    FONT_BOLD = "Helvetica-Bold"
+
 
 class LetterRequest(BaseModel):
     text: str
@@ -12,106 +31,117 @@ class LetterRequest(BaseModel):
     date: str = ""
     seal: bool = True
 
-# CSS braces escaped as {{ }} for Python .format()
-HTML_TEMPLATE = """\
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{
-  font-family: 'DejaVu Serif', 'Times New Roman', Georgia, serif;
-  font-size: 12pt;
-  color: #1a1a1a;
-  padding: 2.5cm 3cm 3cm 3cm;
-}}
-.header {{
-  text-align: center;
-  border-bottom: 2px solid #2c3e50;
-  padding-bottom: 0.8cm;
-  margin-bottom: 1.2cm;
-}}
-.company-name {{
-  font-size: 16pt;
-  font-weight: bold;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: #2c3e50;
-}}
-.company-tagline {{
-  font-size: 9pt;
-  color: #7f8c8d;
-  margin-top: 0.2cm;
-}}
-.date {{
-  text-align: right;
-  margin-bottom: 0.8cm;
-  font-size: 11pt;
-  color: #555;
-}}
-.letter-body {{
-  line-height: 1.8;
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  font-size: 12pt;
-}}
-.footer {{
-  margin-top: 2.5cm;
-  border-top: 1px solid #bdc3c7;
-  padding-top: 0.6cm;
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-}}
-.seal-area {{
-  width: 4cm;
-  height: 4cm;
-  border: 3px solid #2c3e50;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  font-size: 7pt;
-  color: #2c3e50;
-  font-weight: bold;
-  padding: 0.3cm;
-  line-height: 1.4;
-}}
-</style>
-</head>
-<body>
-<div class="header">
-  <div class="company-name">{entity_name}</div>
-  <div class="company-tagline">GoodSupport &middot; Официальное письмо</div>
-</div>
-<div class="date">{date}</div>
-<div class="letter-body">{text_escaped}</div>
-<div class="footer">
-  <div></div>
-  <div class="seal-area">М.П.<br><br>ПЕЧАТЬ<br>{entity_short}</div>
-</div>
-</body>
-</html>"""
+
+def draw_letter(buffer: io.BytesIO, req: LetterRequest) -> None:
+    W, H = A4
+    c = canvas.Canvas(buffer, pagesize=A4)
+
+    DARK = HexColor("#2c3e50")
+    GREY = HexColor("#7f8c8d")
+    LIGHT = HexColor("#bdc3c7")
+    margin_l = 3 * cm
+    margin_r = 2 * cm
+    text_width = W - margin_l - margin_r
+
+    y = H - 2 * cm  # start from top
+
+    # ── Header: company name ──
+    c.setFillColor(DARK)
+    c.setFont(FONT_BOLD, 16)
+    name = req.entity_name.upper()
+    name_w = c.stringWidth(name, FONT_BOLD, 16)
+    c.drawString((W - name_w) / 2, y, name)
+    y -= 0.5 * cm
+
+    c.setFont(FONT_NAME, 8)
+    c.setFillColor(GREY)
+    tagline = "GoodSupport  ·  Официальное письмо"
+    tg_w = c.stringWidth(tagline, FONT_NAME, 8)
+    c.drawString((W - tg_w) / 2, y, tagline)
+    y -= 0.35 * cm
+
+    # Divider line
+    c.setStrokeColor(DARK)
+    c.setLineWidth(1.5)
+    c.line(margin_l, y, W - margin_r, y)
+    y -= 0.8 * cm
+
+    # ── Date ──
+    if req.date:
+        c.setFont(FONT_NAME, 10)
+        c.setFillColor(GREY)
+        date_w = c.stringWidth(req.date, FONT_NAME, 10)
+        c.drawString(W - margin_r - date_w, y, req.date)
+        y -= 0.8 * cm
+
+    # ── Letter body ──
+    c.setFont(FONT_NAME, 11.5)
+    c.setFillColor(black)
+    line_h = 0.62 * cm
+    bottom_margin = 5 * cm  # leave room for footer
+
+    for raw_line in req.text.split("\n"):
+        # Word-wrap long lines
+        words = raw_line.split(" ") if raw_line.strip() else [""]
+        current = ""
+        for word in words:
+            test = (current + " " + word).strip()
+            if c.stringWidth(test, FONT_NAME, 11.5) <= text_width:
+                current = test
+            else:
+                if y < bottom_margin:
+                    c.showPage()
+                    y = H - 2 * cm
+                    c.setFont(FONT_NAME, 11.5)
+                    c.setFillColor(black)
+                c.drawString(margin_l, y, current)
+                y -= line_h
+                current = word
+        # Last chunk
+        if y < bottom_margin:
+            c.showPage()
+            y = H - 2 * cm
+            c.setFont(FONT_NAME, 11.5)
+            c.setFillColor(black)
+        c.drawString(margin_l, y, current)
+        y -= line_h
+
+    # ── Footer divider ──
+    footer_y = 3.5 * cm
+    c.setStrokeColor(LIGHT)
+    c.setLineWidth(0.8)
+    c.line(margin_l, footer_y, W - margin_r, footer_y)
+
+    # ── Seal circle ──
+    if req.seal:
+        seal_cx = W - margin_r - 2 * cm
+        seal_cy = footer_y - 1.5 * cm
+        seal_r = 1.5 * cm
+
+        c.setStrokeColor(DARK)
+        c.setFillColor(white)
+        c.setLineWidth(2)
+        c.circle(seal_cx, seal_cy, seal_r, stroke=1, fill=1)
+
+        c.setFillColor(DARK)
+        c.setFont(FONT_BOLD, 7)
+        short = req.entity_name.replace("ООО ", "").replace("ИП ", "")[:12]
+        lines_seal = ["М.П.", "ПЕЧАТЬ", short]
+        for i, sl in enumerate(lines_seal):
+            sw = c.stringWidth(sl, FONT_BOLD, 7)
+            c.drawString(seal_cx - sw / 2, seal_cy + 0.3 * cm - i * 0.45 * cm, sl)
+
+    c.save()
 
 
 @app.post("/generate")
 async def generate_pdf(req: LetterRequest):
-    text_escaped = html_lib.escape(req.text)
-    entity_short = req.entity_name.replace("ООО ", "").replace("ИП ", "")[:12]
-
-    html_content = HTML_TEMPLATE.format(
-        entity_name=html_lib.escape(req.entity_name),
-        date=html_lib.escape(req.date) if req.date else "",
-        text_escaped=text_escaped,
-        entity_short=html_lib.escape(entity_short),
-    )
-
-    pdf_bytes = HTML(string=html_content).write_pdf()
+    buf = io.BytesIO()
+    draw_letter(buf, req)
+    pdf_bytes = buf.getvalue()
     return JSONResponse({"pdf_base64": base64.b64encode(pdf_bytes).decode()})
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "font": FONT_NAME}
