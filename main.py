@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import base64, io
+import base64, io, httpx
+from datetime import datetime
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib.colors import HexColor, black, white
@@ -20,7 +21,6 @@ try:
     FONT_NAME = "DejaVu"
     FONT_BOLD = "DejaVuBold"
 except Exception:
-    # Fallback to Helvetica (no Cyrillic, but won't crash)
     FONT_NAME = "Helvetica"
     FONT_BOLD = "Helvetica-Bold"
 
@@ -30,6 +30,16 @@ class LetterRequest(BaseModel):
     entity_name: str = "ИП Лапшенков"
     date: str = ""
     seal: bool = True
+
+
+class SendLetterRequest(BaseModel):
+    text: str
+    entity_name: str = "ИП Лапшенков"
+    date: str = ""
+    seal: bool = True
+    chat_id: str
+    bot_token: str
+    caption: str = ""
 
 
 def draw_letter(buffer: io.BytesIO, req: LetterRequest) -> None:
@@ -43,7 +53,7 @@ def draw_letter(buffer: io.BytesIO, req: LetterRequest) -> None:
     margin_r = 2 * cm
     text_width = W - margin_l - margin_r
 
-    y = H - 2 * cm  # start from top
+    y = H - 2 * cm
 
     # ── Header: company name ──
     c.setFillColor(DARK)
@@ -78,10 +88,9 @@ def draw_letter(buffer: io.BytesIO, req: LetterRequest) -> None:
     c.setFont(FONT_NAME, 11.5)
     c.setFillColor(black)
     line_h = 0.62 * cm
-    bottom_margin = 5 * cm  # leave room for footer
+    bottom_margin = 5 * cm
 
     for raw_line in req.text.split("\n"):
-        # Word-wrap long lines
         words = raw_line.split(" ") if raw_line.strip() else [""]
         current = ""
         for word in words:
@@ -97,7 +106,6 @@ def draw_letter(buffer: io.BytesIO, req: LetterRequest) -> None:
                 c.drawString(margin_l, y, current)
                 y -= line_h
                 current = word
-        # Last chunk
         if y < bottom_margin:
             c.showPage()
             y = H - 2 * cm
@@ -140,6 +148,38 @@ async def generate_pdf(req: LetterRequest):
     draw_letter(buf, req)
     pdf_bytes = buf.getvalue()
     return JSONResponse({"pdf_base64": base64.b64encode(pdf_bytes).decode()})
+
+
+@app.post("/send")
+async def send_letter(req: SendLetterRequest):
+    """Generate PDF and send directly to Telegram — bypasses n8n binary upload issues."""
+    buf = io.BytesIO()
+    draw_letter(buf, LetterRequest(
+        text=req.text,
+        entity_name=req.entity_name,
+        date=req.date,
+        seal=req.seal
+    ))
+    pdf_bytes = buf.getvalue()
+
+    fname = f"Письмо_{datetime.now().strftime('%Y-%m-%d')}.pdf"
+    caption = req.caption or f"📄 Письмо — {req.entity_name}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"https://api.telegram.org/bot{req.bot_token}/sendDocument",
+            data={"chat_id": req.chat_id, "caption": caption},
+            files={"document": (fname, pdf_bytes, "application/pdf")}
+        )
+
+    result = resp.json()
+    if result.get("ok"):
+        return {"success": True}
+    else:
+        return JSONResponse(
+            {"success": False, "error": result.get("description", "Telegram error")},
+            status_code=500
+        )
 
 
 @app.get("/health")
